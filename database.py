@@ -1,22 +1,30 @@
-"""SQLite 데이터베이스 초기화 및 CRUD."""
-import sqlite3
-from contextlib import contextmanager
+"""MongoDB Atlas 데이터베이스 CRUD."""
+import hashlib
+import re
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Optional
 
-from config import (
-    DATABASE_PATH,
+from bson import ObjectId
+from bson.errors import InvalidId
+from gridfs import GridFS
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+
+from settings import (
     DEFAULT_CATEGORIES,
-    ensure_dirs,
+    EMAIL_PATTERN,
+    get_admin_email,
     get_admin_password,
     get_admin_phone,
     get_admin_setup_code,
+    get_mongodb_db_name,
+    get_mongodb_uri,
 )
+
+_client: Optional[MongoClient] = None
 
 
 def _hash_password(password: str) -> str:
-    import hashlib
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
@@ -24,100 +32,67 @@ def _normalize_phone(phone: str) -> str:
     return phone.strip().replace("-", "").replace(" ", "")
 
 
-@contextmanager
-def get_connection():
-    ensure_dirs()
-    conn = sqlite3.connect(str(DATABASE_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+def _oid(id_value: str | ObjectId) -> ObjectId:
+    if isinstance(id_value, ObjectId):
+        return id_value
+    return ObjectId(str(id_value))
+
+
+def _id_str(doc: dict) -> dict:
+    if doc and "_id" in doc:
+        doc["id"] = str(doc["_id"])
+    return doc
+
+
+def get_db():
+    global _client
+    uri = get_mongodb_uri()
+    if not uri:
+        raise RuntimeError(
+            "MongoDB URI가 설정되지 않았습니다. "
+            ".streamlit/secrets.toml에 [mongodb] uri를 추가하세요."
+        )
+    if _client is None:
+        _client = MongoClient(uri, serverSelectionTimeoutMS=8000)
+    return _client[get_mongodb_db_name()]
+
+
+def get_gridfs() -> GridFS:
+    return GridFS(get_db())
 
 
 def init_db():
-    with get_connection() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                name TEXT NOT NULL,
-                center TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'user',
-                created_at TEXT NOT NULL
-            );
+    db = get_db()
+    db.users.create_index("phone", unique=True)
+    db.users.create_index("email", unique=True)
+    db.categories.create_index("name", unique=True)
+    db.posts.create_index("category_id")
+    db.posts.create_index("created_at")
 
-            CREATE TABLE IF NOT EXISTS categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                description TEXT DEFAULT '',
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category_id INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                author_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (category_id) REFERENCES categories(id),
-                FOREIGN KEY (author_id) REFERENCES users(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS post_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                post_id INTEGER NOT NULL,
-                filename TEXT NOT NULL,
-                stored_name TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
-            );
-            """
+    now = datetime.now().isoformat()
+    for name in DEFAULT_CATEGORIES:
+        db.categories.update_one(
+            {"name": name},
+            {"$setOnInsert": {"name": name, "description": "", "created_at": now}},
+            upsert=True,
         )
 
-        # 기본 카테고리
-        now = datetime.now().isoformat()
-        for name in DEFAULT_CATEGORIES:
-            conn.execute(
-                "INSERT OR IGNORE INTO categories (name, description, created_at) VALUES (?, '', ?)",
-                (name, now),
-            )
-
-        # 관리자가 한 명도 없을 때만 기본 관리자 자동 생성
-        admin_count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
-        if admin_count == 0:
-            admin_phone = _normalize_phone(get_admin_phone())
-            conn.execute(
-                "INSERT INTO users (phone, password_hash, name, center, role, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    admin_phone,
-                    _hash_password(get_admin_password()),
-                    "관리자",
-                    "본사",
-                    "admin",
-                    now,
-                ),
-            )
-
-
-def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return dict(row) if row else {}
+    if db.users.count_documents({"role": "admin"}) == 0:
+        db.users.insert_one(
+            {
+                "phone": _normalize_phone(get_admin_phone()),
+                "password_hash": _hash_password(get_admin_password()),
+                "name": "관리자",
+                "center": "본사",
+                "email": get_admin_email().strip().lower(),
+                "role": "admin",
+                "created_at": now,
+            }
+        )
 
 
 def count_admins() -> int:
-    with get_connection() as conn:
-        return conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
+    return get_db().users.count_documents({"role": "admin"})
 
 
 def create_user(
@@ -125,15 +100,20 @@ def create_user(
     password: str,
     name: str,
     center: str,
+    email: str,
     admin_code: str = "",
 ) -> tuple[bool, str, Optional[dict[str, Any]]]:
     phone = _normalize_phone(phone)
+    email = email.strip().lower()
+
     if len(phone) < 10:
         return False, "올바른 전화번호를 입력해 주세요.", None
     if len(password) < 6:
         return False, "비밀번호는 6자 이상이어야 합니다.", None
     if not name.strip() or not center.strip():
         return False, "성명과 소속을 입력해 주세요.", None
+    if not email or not EMAIL_PATTERN.match(email):
+        return False, "올바른 이메일을 입력해 주세요.", None
 
     role = "user"
     setup_code = get_admin_setup_code().strip()
@@ -142,80 +122,91 @@ def create_user(
     elif count_admins() == 0:
         role = "admin"
 
+    doc = {
+        "phone": phone,
+        "password_hash": _hash_password(password),
+        "name": name.strip(),
+        "center": center.strip(),
+        "email": email,
+        "role": role,
+        "created_at": datetime.now().isoformat(),
+    }
     try:
-        with get_connection() as conn:
-            conn.execute(
-                "INSERT INTO users (phone, password_hash, name, center, role, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    phone,
-                    _hash_password(password),
-                    name.strip(),
-                    center.strip(),
-                    role,
-                    datetime.now().isoformat(),
-                ),
-            )
-            row = conn.execute(
-                "SELECT id, phone, name, center, role FROM users WHERE phone = ?",
-                (phone,),
-            ).fetchone()
-        user = _row_to_dict(row)
+        result = get_db().users.insert_one(doc)
+        user = {
+            "id": str(result.inserted_id),
+            "phone": phone,
+            "name": doc["name"],
+            "center": doc["center"],
+            "email": email,
+            "role": role,
+        }
         role_msg = "관리자" if role == "admin" else "사용자"
         return True, f"회원가입 완료 ({role_msg} 권한).", user
-    except sqlite3.IntegrityError:
-        return False, "이미 등록된 전화번호입니다.", None
+    except DuplicateKeyError:
+        return False, "이미 등록된 전화번호 또는 이메일입니다.", None
 
 
 def authenticate(phone: str, password: str) -> Optional[dict[str, Any]]:
     phone = _normalize_phone(phone)
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT id, phone, name, center, role FROM users WHERE phone = ? AND password_hash = ?",
-            (phone, _hash_password(password)),
-        ).fetchone()
-    return _row_to_dict(row) if row else None
-
-
-def get_user_by_id(user_id: int) -> Optional[dict[str, Any]]:
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT id, phone, name, center, role FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    return _row_to_dict(row) if row else None
+    row = get_db().users.find_one(
+        {"phone": phone, "password_hash": _hash_password(password)},
+        {"phone": 1, "name": 1, "center": 1, "email": 1, "role": 1},
+    )
+    if not row:
+        return None
+    return {
+        "id": str(row["_id"]),
+        "phone": row["phone"],
+        "name": row["name"],
+        "center": row["center"],
+        "email": row.get("email", ""),
+        "role": row["role"],
+    }
 
 
 def list_users() -> list[dict[str, Any]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT id, phone, name, center, role, created_at FROM users ORDER BY id"
-        ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    rows = get_db().users.find().sort("_id", 1)
+    result = []
+    for r in rows:
+        result.append(
+            {
+                "id": str(r["_id"]),
+                "phone": r["phone"],
+                "name": r["name"],
+                "center": r["center"],
+                "email": r.get("email", ""),
+                "role": r["role"],
+                "created_at": r.get("created_at", ""),
+            }
+        )
+    return result
 
 
-def set_user_role(user_id: int, role: str) -> tuple[bool, str]:
+def set_user_role(user_id: str, role: str) -> tuple[bool, str]:
     if role not in ("admin", "user"):
         return False, "잘못된 권한입니다."
-    with get_connection() as conn:
-        if role == "user":
-            admin_count = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE role = 'admin'"
-            ).fetchone()[0]
-            current = conn.execute(
-                "SELECT role FROM users WHERE id = ?", (user_id,)
-            ).fetchone()
-            if current and current[0] == "admin" and admin_count <= 1:
-                return False, "최소 1명의 관리자가 필요합니다."
-        conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+    db = get_db()
+    if role == "user":
+        admin_count = db.users.count_documents({"role": "admin"})
+        current = db.users.find_one({"_id": _oid(user_id)}, {"role": 1})
+        if current and current.get("role") == "admin" and admin_count <= 1:
+            return False, "최소 1명의 관리자가 필요합니다."
+    db.users.update_one({"_id": _oid(user_id)}, {"$set": {"role": role}})
     return True, "권한이 변경되었습니다."
 
 
 def list_categories() -> list[dict[str, Any]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT id, name, description, created_at FROM categories ORDER BY id"
-        ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    rows = get_db().categories.find().sort("_id", 1)
+    return [
+        {
+            "id": str(r["_id"]),
+            "name": r["name"],
+            "description": r.get("description", ""),
+            "created_at": r.get("created_at", ""),
+        }
+        for r in rows
+    ]
 
 
 def create_category(name: str, description: str = "") -> tuple[bool, str]:
@@ -223,132 +214,123 @@ def create_category(name: str, description: str = "") -> tuple[bool, str]:
     if not name:
         return False, "카테고리 이름을 입력해 주세요."
     try:
-        with get_connection() as conn:
-            conn.execute(
-                "INSERT INTO categories (name, description, created_at) VALUES (?, ?, ?)",
-                (name, description.strip(), datetime.now().isoformat()),
-            )
+        get_db().categories.insert_one(
+            {
+                "name": name,
+                "description": description.strip(),
+                "created_at": datetime.now().isoformat(),
+            }
+        )
         return True, "카테고리가 추가되었습니다."
-    except sqlite3.IntegrityError:
+    except DuplicateKeyError:
         return False, "이미 존재하는 카테고리입니다."
 
 
-def update_category(category_id: int, name: str, description: str = "") -> tuple[bool, str]:
+def update_category(category_id: str, name: str, description: str = "") -> tuple[bool, str]:
     name = name.strip()
     if not name:
         return False, "카테고리 이름을 입력해 주세요."
     try:
-        with get_connection() as conn:
-            conn.execute(
-                "UPDATE categories SET name = ?, description = ? WHERE id = ?",
-                (name, description.strip(), category_id),
-            )
+        get_db().categories.update_one(
+            {"_id": _oid(category_id)},
+            {"$set": {"name": name, "description": description.strip()}},
+        )
         return True, "카테고리가 수정되었습니다."
-    except sqlite3.IntegrityError:
+    except DuplicateKeyError:
         return False, "이미 존재하는 카테고리 이름입니다."
 
 
-def delete_category(category_id: int) -> tuple[bool, str]:
-    with get_connection() as conn:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM posts WHERE category_id = ?",
-            (category_id,),
-        ).fetchone()[0]
-        if count > 0:
-            return False, f"이 카테고리에 게시글이 {count}개 있어 삭제할 수 없습니다."
-        conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+def delete_category(category_id: str) -> tuple[bool, str]:
+    db = get_db()
+    count = db.posts.count_documents({"category_id": category_id})
+    if count > 0:
+        return False, f"이 카테고리에 게시글이 {count}개 있어 삭제할 수 없습니다."
+    db.categories.delete_one({"_id": _oid(category_id)})
     return True, "카테고리가 삭제되었습니다."
 
 
-def list_posts(category_id: Optional[int] = None) -> list[dict[str, Any]]:
-    with get_connection() as conn:
-        if category_id:
-            rows = conn.execute(
-                """
-                SELECT p.id, p.category_id, p.title, p.content, p.author_id, p.created_at, p.updated_at,
-                       c.name AS category_name, u.name AS author_name
-                FROM posts p
-                JOIN categories c ON p.category_id = c.id
-                JOIN users u ON p.author_id = u.id
-                WHERE p.category_id = ?
-                ORDER BY p.created_at DESC
-                """,
-                (category_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT p.id, p.category_id, p.title, p.content, p.author_id, p.created_at, p.updated_at,
-                       c.name AS category_name, u.name AS author_name
-                FROM posts p
-                JOIN categories c ON p.category_id = c.id
-                JOIN users u ON p.author_id = u.id
-                ORDER BY p.created_at DESC
-                """
-            ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+def _enrich_post(post: dict) -> dict:
+    db = get_db()
+    cat = db.categories.find_one({"_id": _oid(post["category_id"])}, {"name": 1})
+    author = db.users.find_one({"_id": _oid(post["author_id"])}, {"name": 1})
+    return {
+        "id": str(post["_id"]),
+        "category_id": post["category_id"],
+        "title": post["title"],
+        "content": post["content"],
+        "author_id": post["author_id"],
+        "created_at": post.get("created_at", ""),
+        "updated_at": post.get("updated_at", ""),
+        "category_name": cat["name"] if cat else "",
+        "author_name": author["name"] if author else "",
+    }
 
 
-def get_post(post_id: int) -> Optional[dict[str, Any]]:
-    with get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT p.id, p.category_id, p.title, p.content, p.author_id, p.created_at, p.updated_at,
-                   c.name AS category_name, u.name AS author_name
-            FROM posts p
-            JOIN categories c ON p.category_id = c.id
-            JOIN users u ON p.author_id = u.id
-            WHERE p.id = ?
-            """,
-            (post_id,),
-        ).fetchone()
-    return _row_to_dict(row) if row else None
+def list_posts(category_id: Optional[str] = None) -> list[dict[str, Any]]:
+    query = {}
+    if category_id:
+        query["category_id"] = category_id
+    rows = get_db().posts.find(query).sort("created_at", -1)
+    return [_enrich_post(r) for r in rows]
 
 
-def create_post(category_id: int, title: str, content: str, author_id: int) -> int:
+def get_post(post_id: str) -> Optional[dict[str, Any]]:
+    try:
+        row = get_db().posts.find_one({"_id": _oid(post_id)})
+    except InvalidId:
+        return None
+    return _enrich_post(row) if row else None
+
+
+def create_post(category_id: str, title: str, content: str, author_id: str) -> str:
     now = datetime.now().isoformat()
-    with get_connection() as conn:
-        cursor = conn.execute(
-            "INSERT INTO posts (category_id, title, content, author_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (category_id, title.strip(), content, author_id, now, now),
-        )
-        return cursor.lastrowid
+    result = get_db().posts.insert_one(
+        {
+            "category_id": category_id,
+            "title": title.strip(),
+            "content": content,
+            "author_id": author_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    return str(result.inserted_id)
 
 
-def delete_post(post_id: int) -> None:
-    files = get_post_files(post_id)
-    with get_connection() as conn:
-        conn.execute("DELETE FROM post_files WHERE post_id = ?", (post_id,))
-        conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
-    for f in files:
-        path = Path(f["stored_path"])
-        if path.exists():
-            path.unlink()
+def delete_post(post_id: str) -> None:
+    fs = get_gridfs()
+    for f in get_post_files(post_id):
+        try:
+            fs.delete(_oid(f["gridfs_id"]))
+        except Exception:
+            pass
+    get_db().posts.delete_one({"_id": _oid(post_id)})
 
 
-def add_post_file(post_id: int, filename: str, stored_name: str, file_type: str) -> int:
-    from config import UPLOAD_DIR
+def add_post_file(post_id: str, filename: str, data: bytes, file_type: str) -> str:
+    fs = get_gridfs()
+    grid_id = fs.put(
+        data,
+        filename=filename,
+        content_type=file_type,
+        metadata={"post_id": post_id},
+    )
+    return str(grid_id)
 
-    stored_path = UPLOAD_DIR / stored_name
-    with get_connection() as conn:
-        cursor = conn.execute(
-            "INSERT INTO post_files (post_id, filename, stored_name, file_type, created_at) VALUES (?, ?, ?, ?, ?)",
-            (post_id, filename, stored_name, file_type, datetime.now().isoformat()),
-        )
-        return cursor.lastrowid
 
-
-def get_post_files(post_id: int) -> list[dict[str, Any]]:
-    from config import UPLOAD_DIR
-
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT id, post_id, filename, stored_name, file_type, created_at FROM post_files WHERE post_id = ?",
-            (post_id,),
-        ).fetchall()
+def get_post_files(post_id: str) -> list[dict[str, Any]]:
+    fs = get_gridfs()
+    files = fs.find({"metadata.post_id": post_id})
     result = []
-    for r in rows:
-        d = _row_to_dict(r)
-        d["stored_path"] = str(UPLOAD_DIR / d["stored_name"])
-        result.append(d)
+    for f in files:
+        result.append(
+            {
+                "id": str(f._id),
+                "gridfs_id": str(f._id),
+                "post_id": post_id,
+                "filename": f.filename,
+                "file_type": f.content_type or "application/octet-stream",
+                "data": f.read(),
+            }
+        )
     return result

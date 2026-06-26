@@ -1,16 +1,11 @@
 """Streamlit 메인 앱 — 엔지니어 현장 지원 플랫폼."""
-import uuid
-from pathlib import Path
-
 import streamlit as st
 
-from config import (
-    DATA_ROOT,
+from settings import (
     DEFAULT_ADMIN_PASSWORD,
     DEFAULT_ADMIN_PHONE,
-    UPLOAD_DIR,
-    ensure_dirs,
     get_admin_setup_code,
+    get_mongodb_uri,
 )
 from database import (
     add_post_file,
@@ -29,6 +24,14 @@ from database import (
     set_user_role,
     update_category,
 )
+from editor_helpers import (
+    apply_bold,
+    apply_color,
+    apply_size,
+    count_chars,
+    readability_hint,
+    render_preview,
+)
 
 st.set_page_config(
     page_title="현장 지원 플랫폼",
@@ -37,8 +40,19 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-ensure_dirs()
-init_db()
+if not get_mongodb_uri():
+    st.error(
+        "MongoDB Atlas 연결이 필요합니다. `.streamlit/secrets.toml`에 아래를 설정하세요.\n\n"
+        "[mongodb]\nuri = \"mongodb+srv://...\""
+    )
+    st.stop()
+
+try:
+    init_db()
+except Exception as e:
+    st.error(f"MongoDB 연결 실패: {e}")
+    st.info("Atlas URI, IP 허용 목록(0.0.0.0/0), 사용자 권한을 확인하세요.")
+    st.stop()
 
 
 def init_session():
@@ -46,7 +60,7 @@ def init_session():
         "user": None,
         "page": "home",
         "view_post_id": None,
-        "selected_category": None,
+        "format_selection": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -70,16 +84,17 @@ def logout():
     st.session_state.view_post_id = None
 
 
-def save_uploaded_files(post_id: int, uploaded_files) -> None:
+def open_post(post_id: str):
+    st.session_state.view_post_id = post_id
+    st.session_state.page = "view_post"
+
+
+def save_uploaded_files(post_id: str, uploaded_files) -> None:
     if not uploaded_files:
         return
     for uf in uploaded_files:
-        ext = Path(uf.name).suffix
-        stored_name = f"{post_id}_{uuid.uuid4().hex}{ext}"
-        dest = UPLOAD_DIR / stored_name
-        dest.write_bytes(uf.getvalue())
         file_type = uf.type or "application/octet-stream"
-        add_post_file(post_id, uf.name, stored_name, file_type)
+        add_post_file(post_id, uf.name, uf.getvalue(), file_type)
 
 
 st.markdown(
@@ -94,6 +109,29 @@ st.markdown(
     }
     .main-header h1 { color: white !important; margin: 0; font-size: 1.8rem; }
     .main-header p { color: #e2e8f0; margin: 0.3rem 0 0 0; }
+  .post-row-btn button {
+        text-align: left !important;
+        background: #f8fafc !important;
+        border: 1px solid #e2e8f0 !important;
+        border-radius: 8px !important;
+        padding: 0.75rem 1rem !important;
+        color: #1e293b !important;
+        font-weight: 500 !important;
+        white-space: normal !important;
+        height: auto !important;
+        min-height: 3rem !important;
+    }
+    .post-row-btn button:hover {
+        background: #e0f2fe !important;
+        border-color: #2563eb !important;
+    }
+    .preview-box {
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 1rem;
+        background: #fff;
+        min-height: 120px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -102,7 +140,7 @@ st.markdown(
 
 with st.sidebar:
     st.markdown("### 🔧 현장 지원 플랫폼")
-    st.caption("공지 · 매뉴얼 · FAQ")
+    st.caption("공지 · 매뉴얼 · FAQ · MongoDB Atlas")
 
     if is_logged_in():
         user = st.session_state.user
@@ -124,6 +162,8 @@ with st.sidebar:
             if st.button("✏️ 글 작성", use_container_width=True, type="primary"):
                 st.session_state.page = "write"
                 st.session_state.view_post_id = None
+                if "write_content" in st.session_state:
+                    st.session_state.write_content = ""
                 st.rerun()
             if st.button("⚙️ 카테고리 관리", use_container_width=True):
                 st.session_state.page = "categories"
@@ -147,9 +187,8 @@ with st.sidebar:
             st.session_state.page = "register"
             st.rerun()
 
-    with st.expander("💾 데이터 저장 위치"):
-        st.code(str(DATA_ROOT), language=None)
-        st.caption("회원·게시글은 위 폴더에 저장됩니다. 사이트를 닫아도 유지됩니다.")
+    with st.expander("💾 데이터 저장"):
+        st.caption("MongoDB Atlas에 회원·게시글·첨부파일이 저장됩니다.")
 
 st.markdown(
     """
@@ -162,31 +201,39 @@ st.markdown(
 )
 
 
-def page_home():
-    st.subheader("📌 최근 게시글")
-    if not is_logged_in():
-        st.info("게시글을 보려면 로그인해 주세요. (사이드바 → 로그인)")
-
-    posts = list_posts()
-    if not posts:
-        st.info("등록된 게시글이 없습니다. 관리자로 로그인 후 글을 작성해 주세요.")
-        return
-
-    for post in posts[:10]:
-        created = post["created_at"][:10]
-        col1, col2 = st.columns([4, 1])
-        with col1:
+def render_post_list(posts: list, key_prefix: str):
+    for post in posts:
+        created = post["created_at"][:10] if post.get("created_at") else ""
+        label = (
+            f"[{post['category_name']}] {post['title']}\n"
+            f"{post['author_name']} · {created}"
+        )
+        if is_logged_in():
+            st.markdown('<div class="post-row-btn">', unsafe_allow_html=True)
+            if st.button(label, key=f"{key_prefix}_{post['id']}", use_container_width=True):
+                open_post(post["id"])
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
             st.markdown(
                 f"**[{post['category_name']}]** {post['title']}  \n"
                 f"<small>{post['author_name']} · {created}</small>",
                 unsafe_allow_html=True,
             )
-        with col2:
-            if is_logged_in() and st.button("보기", key=f"home_view_{post['id']}"):
-                st.session_state.view_post_id = post["id"]
-                st.session_state.page = "view_post"
-                st.rerun()
-        st.divider()
+            st.caption("로그인 후 클릭하여 열람 가능")
+
+
+def page_home():
+    st.subheader("📌 최근 게시글")
+    if not is_logged_in():
+        st.info("게시글을 열람하려면 로그인해 주세요.")
+
+    posts = list_posts()
+    if not posts:
+        st.info("등록된 게시글이 없습니다.")
+        return
+
+    render_post_list(posts[:10], "home")
 
 
 def page_login():
@@ -206,20 +253,15 @@ def page_login():
         else:
             st.error("전화번호 또는 비밀번호가 올바르지 않습니다.")
 
-    with st.expander("관리자 최초 로그인 정보 (Secrets 설정 불필요)"):
+    with st.expander("관리자 최초 로그인 정보"):
         st.markdown(
             f"""
-            앱을 처음 설치했을 때 자동 생성되는 관리자 계정입니다.
-
             | 항목 | 값 |
             |------|-----|
             | 전화번호 | `{DEFAULT_ADMIN_PHONE}` |
             | 비밀번호 | `{DEFAULT_ADMIN_PASSWORD}` |
 
-            로그인 후 사이드바에 **🔴 관리자** 와 **✏️ 글 작성** 버튼이 보입니다.
-
-            **다른 계정을 관리자로 만들기:** 회원가입 시 관리자 등록 코드 입력  
-            → 기본 코드: `{get_admin_setup_code()}`
+            관리자 등록 코드: `{get_admin_setup_code()}`
             """
         )
 
@@ -230,12 +272,13 @@ def page_register():
         name = st.text_input("성명", placeholder="홍길동")
         center = st.text_input("소속(센터)", placeholder="서울센터")
         phone = st.text_input("전화번호", placeholder="01012345678")
+        email = st.text_input("이메일", placeholder="user@example.com")
         password = st.text_input("비밀번호", type="password", help="6자 이상")
         password2 = st.text_input("비밀번호 확인", type="password")
         admin_code = st.text_input(
             "관리자 등록 코드 (선택)",
             placeholder="관리자로 등록할 때만 입력",
-            help=f"관리자 권한이 필요하면 코드 입력: {get_admin_setup_code()}",
+            help=f"코드: {get_admin_setup_code()}",
         )
         submitted = st.form_submit_button("회원가입", type="primary", use_container_width=True)
 
@@ -243,7 +286,7 @@ def page_register():
         if password != password2:
             st.error("비밀번호가 일치하지 않습니다.")
         else:
-            ok, msg, user = create_user(phone, password, name, center, admin_code)
+            ok, msg, user = create_user(phone, password, name, center, email, admin_code)
             if ok:
                 st.session_state.user = user
                 st.session_state.page = "home"
@@ -265,6 +308,8 @@ def page_board():
     if is_admin():
         if st.button("✏️ 새 글 작성"):
             st.session_state.page = "write"
+            if "write_content" in st.session_state:
+                st.session_state.write_content = ""
             st.rerun()
 
     selected_name = st.selectbox("카테고리 선택", ["전체"] + cat_names)
@@ -275,26 +320,13 @@ def page_board():
         posts = list_posts(cat_ids[idx])
 
     st.subheader(f"📋 {selected_name} 게시글 ({len(posts)}건)")
+    st.caption("게시글을 클릭하면 바로 내용을 볼 수 있습니다.")
 
     if not posts:
         st.info("게시글이 없습니다.")
         return
 
-    for post in posts:
-        created = post["created_at"][:10]
-        col1, col2 = st.columns([5, 1])
-        with col1:
-            st.markdown(
-                f"**{post['title']}**  \n"
-                f"<small>[{post['category_name']}] {post['author_name']} · {created}</small>",
-                unsafe_allow_html=True,
-            )
-        with col2:
-            if st.button("보기", key=f"board_view_{post['id']}"):
-                st.session_state.view_post_id = post["id"]
-                st.session_state.page = "view_post"
-                st.rerun()
-        st.divider()
+    render_post_list(posts, "board")
 
 
 def page_view_post():
@@ -319,26 +351,22 @@ def page_view_post():
         f"작성일: {post['created_at'][:16].replace('T', ' ')}"
     )
     st.markdown("---")
-    st.markdown(post["content"])
+    st.markdown(post["content"], unsafe_allow_html=True)
 
     files = get_post_files(post_id)
     if files:
         st.markdown("### 📎 첨부 파일")
         for f in files:
-            path = Path(f["stored_path"])
-            if path.exists():
-                file_bytes = path.read_bytes()
-                if f["file_type"].startswith("image/"):
-                    st.image(file_bytes, caption=f["filename"], use_container_width=True)
-                st.download_button(
-                    label=f"⬇️ {f['filename']} 다운로드",
-                    data=file_bytes,
-                    file_name=f["filename"],
-                    mime=f["file_type"],
-                    key=f"dl_{f['id']}",
-                )
-            else:
-                st.warning(f"{f['filename']} — 파일을 찾을 수 없습니다.")
+            data = f["data"]
+            if f["file_type"].startswith("image/"):
+                st.image(data, caption=f["filename"], use_container_width=True)
+            st.download_button(
+                label=f"⬇️ {f['filename']} 다운로드",
+                data=data,
+                file_name=f["filename"],
+                mime=f["file_type"],
+                key=f"dl_{f['id']}",
+            )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -356,7 +384,7 @@ def page_view_post():
 
 def page_write():
     if not is_admin():
-        st.error("관리자만 글을 작성할 수 있습니다. 관리자로 로그인하거나 회원가입 시 관리자 코드를 입력하세요.")
+        st.error("관리자만 글을 작성할 수 있습니다.")
         return
 
     st.subheader("✏️ 새 게시글 작성")
@@ -371,7 +399,102 @@ def page_write():
         options=[c["id"] for c in categories],
         format_func=lambda x: next(c["name"] for c in categories if c["id"] == x),
     )
-    content = st.text_area("내용", height=300, key="write_content")
+
+    st.markdown("#### 내용 작성")
+    st.caption("서식을 적용할 텍스트를 아래에 입력한 뒤 버튼을 누르세요.")
+
+    selection = st.text_input(
+        "서식 적용할 텍스트 (선택)",
+        key="format_selection",
+        placeholder="굵게/색상/크기를 적용할 문장",
+    )
+
+    btn_cols = st.columns(8)
+    with btn_cols[0]:
+        if st.button("**굵게**", use_container_width=True):
+            st.session_state.write_content = apply_bold(
+                st.session_state.write_content, selection
+            )
+            st.rerun()
+    with btn_cols[1]:
+        if st.button("작게", use_container_width=True):
+            st.session_state.write_content = apply_size(
+                st.session_state.write_content, selection, "작게"
+            )
+            st.rerun()
+    with btn_cols[2]:
+        if st.button("보통", use_container_width=True):
+            st.session_state.write_content = apply_size(
+                st.session_state.write_content, selection, "보통"
+            )
+            st.rerun()
+    with btn_cols[3]:
+        if st.button("크게", use_container_width=True):
+            st.session_state.write_content = apply_size(
+                st.session_state.write_content, selection, "크게"
+            )
+            st.rerun()
+    with btn_cols[4]:
+        if st.button("제목", use_container_width=True):
+            st.session_state.write_content = apply_size(
+                st.session_state.write_content, selection, "제목"
+            )
+            st.rerun()
+    with btn_cols[5]:
+        if st.button("⬛ 검정", use_container_width=True):
+            st.session_state.write_content = apply_color(
+                st.session_state.write_content, selection, "검정"
+            )
+            st.rerun()
+    with btn_cols[6]:
+        if st.button("🔵 파란", use_container_width=True):
+            st.session_state.write_content = apply_color(
+                st.session_state.write_content, selection, "파란"
+            )
+            st.rerun()
+    with btn_cols[7]:
+        if st.button("🔴 빨간", use_container_width=True):
+            st.session_state.write_content = apply_color(
+                st.session_state.write_content, selection, "빨간"
+            )
+            st.rerun()
+
+    content = st.text_area(
+        "본문 (HTML 서식 지원)",
+        height=280,
+        key="write_content",
+        help="문단 사이에 빈 줄을 넣으면 읽기 쉽습니다.",
+    )
+
+    counts = count_chars(content)
+    level, hint = readability_hint(counts)
+
+    info_col, guide_col = st.columns([1, 1])
+    with info_col:
+        st.metric("글자 수 (공백 포함)", f"{counts['total']}자")
+        st.metric("글자 수 (공백 제외)", f"{counts['no_space']}자")
+        st.metric("줄 수", f"{counts['lines']}줄")
+    with guide_col:
+        st.markdown("#### 📖 가독성 가이드")
+        st.info(
+            "• 한 문단은 2~4줄 이내 권장\n"
+            "• 중요 내용은 **굵게** 또는 🔴 빨간색\n"
+            "• 연락처·조치 순서는 목록으로 정리\n"
+            "• 모바일 화면: 300~800자 내외가 읽기 좋음"
+        )
+        if level == "success":
+            st.success(hint)
+        elif level == "warning":
+            st.warning(hint)
+        else:
+            st.info(hint)
+
+    st.markdown("#### 👁️ 사용자 화면 미리보기")
+    st.markdown(
+        f'<div class="preview-box">{render_preview(content)}</div>',
+        unsafe_allow_html=True,
+    )
+
     uploaded = st.file_uploader(
         "파일/이미지 업로드",
         accept_multiple_files=True,
@@ -388,6 +511,8 @@ def page_write():
             save_uploaded_files(post_id, uploaded)
             st.session_state.view_post_id = post_id
             st.session_state.page = "view_post"
+            if "write_content" in st.session_state:
+                st.session_state.write_content = ""
             st.rerun()
 
 
@@ -444,27 +569,25 @@ def page_users():
         return
 
     st.subheader("👥 회원 / 권한 관리")
-    st.caption(f"관리자 등록 코드 (회원가입 시 사용): `{get_admin_setup_code()}`")
+    st.caption(f"관리자 등록 코드: `{get_admin_setup_code()}`")
 
     for u in list_users():
         role_label = "관리자" if u["role"] == "admin" else "사용자"
-        st.markdown(f"**{u['name']}** · {u['center']} · {u['phone']} · `{role_label}`")
+        st.markdown(
+            f"**{u['name']}** · {u['center']} · {u['phone']} · {u.get('email', '')} · `{role_label}`"
+        )
 
         if u["id"] != st.session_state.user["id"]:
             col1, col2 = st.columns(2)
             with col1:
-                if u["role"] != "admin" and st.button(
-                    "관리자로 지정", key=f"promote_{u['id']}"
-                ):
+                if u["role"] != "admin" and st.button("관리자로 지정", key=f"promote_{u['id']}"):
                     ok, msg = set_user_role(u["id"], "admin")
                     if ok:
                         st.rerun()
                     else:
                         st.error(msg)
             with col2:
-                if u["role"] == "admin" and st.button(
-                    "사용자로 변경", key=f"demote_{u['id']}"
-                ):
+                if u["role"] == "admin" and st.button("사용자로 변경", key=f"demote_{u['id']}"):
                     ok, msg = set_user_role(u["id"], "user")
                     if ok:
                         st.rerun()
