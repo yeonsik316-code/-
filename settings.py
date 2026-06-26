@@ -11,7 +11,9 @@ DATA_ROOT = Path(
         str(Path.home() / "field_support_platform"),
     )
 )
+DATA_DIR = DATA_ROOT / "data"
 UPLOAD_DIR = DATA_ROOT / "uploads"
+DATABASE_PATH = DATA_DIR / "app.db"
 
 DEFAULT_CATEGORIES = [
     "공지사항",
@@ -23,7 +25,6 @@ DEFAULT_ADMIN_SETUP_CODE = "fieldadmin2024"
 DEFAULT_ADMIN_PHONE = "01000000000"
 DEFAULT_ADMIN_PASSWORD = "admin1234"
 DEFAULT_ADMIN_EMAIL = "admin@example.com"
-DEFAULT_MONGODB_DB = "field_support_platform"
 
 EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 
@@ -56,23 +57,6 @@ def get_admin_email() -> str:
     return _secrets_get("admin", "email", DEFAULT_ADMIN_EMAIL)
 
 
-def get_mongodb_uri() -> str:
-    uri = os.getenv("MONGODB_URI", "")
-    if not uri:
-        uri = _secrets_get("mongodb", "uri", "")
-    return uri.strip()
-
-
-def get_mongodb_db_name() -> str:
-    name = os.getenv("MONGODB_DB", "")
-    if not name:
-        name = _secrets_get("mongodb", "db_name", DEFAULT_MONGODB_DB)
-    return name.strip() or DEFAULT_MONGODB_DB
-
-
-def get_openai_api_key() -> str:
-    return os.getenv("OPENAI_API_KEY", "") or _secrets_get("openai", "api_key", "")
-
-
 def ensure_dirs():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 데이터 및 업로드 (로컬 개발용 — 배포 시 외부 DB 권장)
+data/
+uploads/
+
+# Streamlit secrets (로컬용 secrets.toml은 .gitignore — example 참고)
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db

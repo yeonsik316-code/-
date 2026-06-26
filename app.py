@@ -1,11 +1,15 @@
 """Streamlit 메인 앱 — 엔지니어 현장 지원 플랫폼."""
+import uuid
+
 import streamlit as st
 
 from settings import (
+    DATA_ROOT,
     DEFAULT_ADMIN_PASSWORD,
     DEFAULT_ADMIN_PHONE,
+    UPLOAD_DIR,
+    ensure_dirs,
     get_admin_setup_code,
-    get_mongodb_uri,
 )
 from database import (
     add_post_file,
@@ -40,19 +44,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-if not get_mongodb_uri():
-    st.error(
-        "MongoDB Atlas 연결이 필요합니다. `.streamlit/secrets.toml`에 아래를 설정하세요.\n\n"
-        "[mongodb]\nuri = \"mongodb+srv://...\""
-    )
-    st.stop()
-
-try:
-    init_db()
-except Exception as e:
-    st.error(f"MongoDB 연결 실패: {e}")
-    st.info("Atlas URI, IP 허용 목록(0.0.0.0/0), 사용자 권한을 확인하세요.")
-    st.stop()
+ensure_dirs()
+init_db()
 
 
 def init_session():
@@ -89,12 +82,16 @@ def open_post(post_id: str):
     st.session_state.page = "view_post"
 
 
-def save_uploaded_files(post_id: str, uploaded_files) -> None:
+def save_uploaded_files(post_id: int, uploaded_files) -> None:
     if not uploaded_files:
         return
     for uf in uploaded_files:
+        ext = Path(uf.name).suffix
+        stored_name = f"{post_id}_{uuid.uuid4().hex}{ext}"
+        dest = UPLOAD_DIR / stored_name
+        dest.write_bytes(uf.getvalue())
         file_type = uf.type or "application/octet-stream"
-        add_post_file(post_id, uf.name, uf.getvalue(), file_type)
+        add_post_file(post_id, uf.name, stored_name, file_type)
 
 
 st.markdown(
@@ -140,7 +137,7 @@ st.markdown(
 
 with st.sidebar:
     st.markdown("### 🔧 현장 지원 플랫폼")
-    st.caption("공지 · 매뉴얼 · FAQ · MongoDB Atlas")
+    st.caption("공지 · 매뉴얼 · FAQ")
 
     if is_logged_in():
         user = st.session_state.user
@@ -187,8 +184,9 @@ with st.sidebar:
             st.session_state.page = "register"
             st.rerun()
 
-    with st.expander("💾 데이터 저장"):
-        st.caption("MongoDB Atlas에 회원·게시글·첨부파일이 저장됩니다.")
+    with st.expander("💾 데이터 저장 위치"):
+        st.code(str(DATA_ROOT), language=None)
+        st.caption("회원·게시글은 위 폴더에 저장됩니다. 사이트를 닫아도 유지됩니다.")
 
 st.markdown(
     """
@@ -357,7 +355,10 @@ def page_view_post():
     if files:
         st.markdown("### 📎 첨부 파일")
         for f in files:
-            data = f["data"]
+            data = f.get("data", b"")
+            if not data:
+                st.warning(f"{f['filename']} — 파일을 찾을 수 없습니다.")
+                continue
             if f["file_type"].startswith("image/"):
                 st.image(data, caption=f["filename"], use_container_width=True)
             st.download_button(
